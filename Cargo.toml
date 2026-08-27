@@ -1,0 +1,8 @@
+[package]
+name = "bbts"
+version = "0.6.1"
+authors = ["Hugov / Hugoved"]
+edition = "2024"
+
+[dependencies]
+aes = "0.8"
