@@ -1,6 +1,6 @@
 [package]
 name = "bbts"
-version = "0.6.1"
+version = "0.6.6"
 authors = ["Hugov / Hugoved"]
 edition = "2024"
 

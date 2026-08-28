@@ -179,3 +179,23 @@ pub(crate) fn decrypt_dolby_rpu_unit(
     result.extend_from_slice(best_payload.as_deref().unwrap_or(unit));
     Some(result)
 }
+
+pub(crate) fn is_valid_dolby_rpu_unit(
+    unit: &[u8],
+    key: &[u8; 16],
+    block_key: &[u8; 16],
+) -> bool {
+    let Some(decrypted) = decrypt_dolby_rpu_unit(unit, key, block_key) else {
+        return false;
+    };
+
+    let start_code_length = if decrypted.starts_with(&[0x00, 0x00, 0x00, 0x01]) {
+        4
+    } else if decrypted.starts_with(&[0x00, 0x00, 0x01]) {
+        3
+    } else {
+        return false;
+    };
+
+    dolby_rpu_payload_is_crc_valid(&decrypted[start_code_length..])
+}

@@ -1,4 +1,4 @@
-use crate::common::{AppResult, TS_PACKET_SIZE};
+use crate::common::{AppResult, VideoMode, TS_PACKET_SIZE};
 use crate::crypto::{parse_key_spec, AesBlockEncryptor};
 use crate::hevc::decrypt_es;
 use crate::ts::{
@@ -31,6 +31,7 @@ fn patch_group_in_output(
     block_key: Option<&[u8; 16]>,
     encryptor: &AesBlockEncryptor,
     decryption_key: &[u8; 16],
+    mode: VideoMode,
 ) -> AppResult<bool> {
     if group_entries.is_empty() || block_key.is_none() {
         return Ok(false);
@@ -71,7 +72,33 @@ fn patch_group_in_output(
         return Ok(false);
     }
 
-    let decrypted = decrypt_es(&payload, block_key, encryptor, decryption_key);
+    let decrypted = decrypt_es(&payload, block_key, encryptor, decryption_key, mode);
+    let total_capacity: usize = packet_parts
+        .iter()
+        .map(|part| {
+            let payload_offset = packet_info(&part.packet)
+                .and_then(|info| info.payload_offset)
+                .filter(|&offset| offset <= TS_PACKET_SIZE)
+                .unwrap_or(4);
+            let prefix_len = if part.payload_unit_start {
+                part.pes_header.len()
+            } else {
+                0
+            };
+            TS_PACKET_SIZE
+                .saturating_sub(payload_offset)
+                .saturating_sub(prefix_len)
+        })
+        .sum();
+
+    if decrypted.len() > total_capacity {
+        return Err(format!(
+            "Metadata patch needs {} extra byte(s), but this PES has no packet capacity left",
+            decrypted.len() - total_capacity
+        )
+        .into());
+    }
+
     let mut position = 0usize;
     let mut ended = false;
     let return_position = output.stream_position()?;
@@ -137,6 +164,7 @@ fn flush_group(
     active_block_key: Option<[u8; 16]>,
     encryptor: &AesBlockEncryptor,
     decryption_key: &[u8; 16],
+    mode: VideoMode,
 ) -> AppResult<()> {
     let group = current_groups.remove(&pid).unwrap_or_default();
     let group_key = current_group_keys.get(&pid).copied().flatten();
@@ -147,6 +175,7 @@ fn flush_group(
             group_key.as_ref(),
             encryptor,
             decryption_key,
+            mode,
         )?;
     }
     current_groups.insert(pid, Vec::new());
@@ -159,6 +188,7 @@ pub(crate) fn decrypt_bbts_streaming(
     output_path: &Path,
     key: &str,
     progress: &mut ProgressUi,
+    mode: VideoMode,
 ) -> AppResult<()> {
     let decryption_key = parse_key_spec(key)?;
     let encryptor = AesBlockEncryptor::new(&decryption_key);
@@ -248,6 +278,7 @@ pub(crate) fn decrypt_bbts_streaming(
                             active_block_key,
                             &encryptor,
                             &decryption_key,
+                            mode,
                         )?;
                     }
                     current_groups.insert(pid, Vec::new());
@@ -276,6 +307,7 @@ pub(crate) fn decrypt_bbts_streaming(
                 active_block_key,
                 &encryptor,
                 &decryption_key,
+                mode,
             )?;
         }
     }
