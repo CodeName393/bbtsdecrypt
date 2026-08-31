@@ -44,3 +44,8 @@ bbtsdecrypt -i input.bbts -o output.ts -k 31379f0d5fcd5234862efd8aa9a4e95f:e8183
 ## License
 
 This project is licensed under the GPL-3.0 License.
+
+## Acknowledgements
+
+This project is a fork based on [BBTS-Decryptor](https://github.com/Hugoved/BBTS-Decryptor), originally created by [@Hugoved](https://github.com/Hugoved).
+
