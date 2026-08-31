@@ -10,10 +10,7 @@ pub(crate) struct Cli {
 }
 
 fn print_usage(program: &str) {
-    eprintln!(
-        "Usage: {program} -i <input.bbts> -o <output.ts> -k <key | kid:key>"
-    );
-    eprintln!("  key     = 32 hex characters");
+    eprintln!("Usage: {program} -i <input.bbts> -o <output.ts> -k <kid:key>");
     eprintln!("  kid:key = 32 hex characters : 32 hex characters");
 }
 

@@ -51,14 +51,15 @@ fn parse_hex_key(value: &str, label: &str) -> AppResult<[u8; 16]> {
 
 pub(crate) fn parse_key_spec(value: &str) -> AppResult<[u8; 16]> {
     let value = value.trim();
-    if let Some((kid, key)) = value.split_once(':') {
-        if key.contains(':') {
-            return Err("Key must be either 32hex or 32hex:32hex".into());
-        }
-        let _ = parse_hex_key(kid, "KID")?;
-        return parse_hex_key(key, "AES key");
+    let (kid, key) = value
+        .split_once(':')
+        .ok_or("Key must be in KID:KEY format (32hex:32hex)")?;
+
+    if key.contains(':') {
+        return Err("Key must be in KID:KEY format (32hex:32hex)".into());
     }
-    parse_hex_key(value, "AES key")
+    let _ = parse_hex_key(kid, "KID")?;
+    parse_hex_key(key, "AES key")
 }
 
 pub(crate) fn decode_hex_16(value: &[u8]) -> Option<[u8; 16]> {
@@ -74,84 +75,7 @@ pub(crate) fn decode_hex_16(value: &[u8]) -> Option<[u8; 16]> {
     Some(out)
 }
 
-pub(crate) fn decrypt_nal_vb(
-    input_stream: &[u8],
-    block_key: &[u8; 16],
-    encryptor: &AesBlockEncryptor,
-    trailer_size: usize,
-) -> Vec<u8> {
-    let mut loc11 = input_stream.to_vec();
-    let mut loc9 = vec![0u8; loc11.len()];
-    let mut loc22 = 0usize;
-    let mut loc23 = 0usize;
-
-    while loc22 < loc11.len() {
-        if loc22 + 3 < loc11.len()
-            && loc11[loc22] == 0
-            && loc11[loc22 + 1] == 0
-            && loc11[loc22 + 2] == 3
-            && matches!(loc11[loc22 + 3], 0 | 1 | 2 | 3)
-        {
-            loc9[loc23] = loc11[loc22];
-            loc23 += 1;
-            loc9[loc23] = loc11[loc22 + 1];
-            loc23 += 1;
-            loc9[loc23] = loc11[loc22 + 3];
-            loc23 += 1;
-            loc22 += 4;
-        } else {
-            loc9[loc23] = loc11[loc22];
-            loc22 += 1;
-            loc23 += 1;
-        }
-    }
-
-    let payload_size = loc23 as isize - 5 - trailer_size as isize;
-    if payload_size <= 0 {
-        return loc11;
-    }
-    let payload_size = payload_size as usize;
-    let mut loc12 = loc9[5..5 + payload_size].to_vec();
-    let block_count = (loc12.len() + 15) / 16;
-    let mut loc14 = 0usize;
-
-    for block_index in 1..=block_count {
-        let mut loc17 = [0u8; 16];
-        loc17[..12].copy_from_slice(&block_key[..12]);
-        loc17[12..].copy_from_slice(&(block_index as u32).to_be_bytes());
-        if block_index % 10 == 1 || block_index == block_count {
-            loc17 = encryptor.encrypt_block(&loc17);
-        }
-        for &value in &loc17 {
-            if loc14 == loc12.len() {
-                break;
-            }
-            loc12[loc14] ^= value;
-            loc14 += 1;
-        }
-    }
-
-    loc11[5..5 + loc12.len()].copy_from_slice(&loc12);
-    if trailer_size > 0 {
-        let src_start = 5 + loc12.len();
-        let src_end = src_start + trailer_size;
-        if src_end <= loc9.len() && src_end <= loc11.len() {
-            loc11[src_start..src_end].copy_from_slice(&loc9[src_start..src_end]);
-        }
-    }
-
-    let loc10 = loc11
-        .len()
-        .saturating_sub(5 + loc12.len() + trailer_size);
-    if loc10 > 0 {
-
-        let index = loc11.len() - loc10;
-        loc11[index] = 0;
-    }
-    loc11
-}
-
-fn increment_counter(counter: &mut [u8; 16]) {
+pub(crate) fn ctr_inc(counter: &mut [u8; 16]) {
     let mut carry = 1u16;
     for index in (0..16).rev() {
         let value = counter[index] as u16 + carry;
@@ -163,10 +87,10 @@ fn increment_counter(counter: &mut [u8; 16]) {
     }
 }
 
-pub(crate) fn decrypt_es_sparse_stripped_with_padding(
+pub(crate) fn decrypt_es_sparse_with_emulation_removal(
     es: &[u8],
-    key: &[u8; 16],
-    iv_start: &[u8],
+    encryptor: &AesBlockEncryptor,
+    iv_start: &[u8; 16],
 ) -> Vec<u8> {
     let mut stripped = Vec::with_capacity(es.len());
     let mut index = 0usize;
@@ -184,19 +108,16 @@ pub(crate) fn decrypt_es_sparse_stripped_with_padding(
         }
     }
 
-    let mut counter = [0u8; 16];
-    let copy_len = iv_start.len().min(16);
-    counter[..copy_len].copy_from_slice(&iv_start[..copy_len]);
+    let mut counter_iv = *iv_start;
     let mut output = stripped;
     let mut remaining = output.len();
     let mut position = 0usize;
-    let mut block_index = 0usize;
-    let encryptor = AesBlockEncryptor::new(key);
+    let mut counter = 0usize;
 
     while remaining > 0 {
-        increment_counter(&mut counter);
-        let mut temporary = counter;
-        if remaining <= 16 || block_index % 10 == 0 {
+        ctr_inc(&mut counter_iv);
+        let mut temporary = counter_iv;
+        if remaining <= 16 || counter % 10 == 0 {
             temporary = encryptor.encrypt_block(&temporary);
         }
         let decrypt_length = remaining.min(16);
@@ -205,15 +126,13 @@ pub(crate) fn decrypt_es_sparse_stripped_with_padding(
         }
         remaining -= decrypt_length;
         position += 16;
-        block_index += 1;
+        counter += 1;
     }
 
     if output.len() != es.len() {
-        if output.len() < es.len() {
-            let difference = es.len() - output.len();
-            output.extend_from_slice(&es[es.len() - difference..]);
-        } else {
-            output.truncate(es.len());
+        let diff = es.len().saturating_sub(output.len());
+        if diff > 0 {
+            output.extend_from_slice(&es[es.len() - diff..]);
         }
     }
     output

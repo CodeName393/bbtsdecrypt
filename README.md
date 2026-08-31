@@ -1,17 +1,16 @@
-# BBTS Decryptor
+# bbtsdecrypt
 
-A tool for decrypting protected **BBTS / MPEG-TS** streams with support for **HEVC**, **Dolby Vision**, and **HDR Vivid** metadata.
+A high-performance, lightweight tool for decrypting protected **BBTS / MPEG-TS** streams with full lossless preservation of **AVC (H.264)**, **HEVC (H.265)**, **Dolby Vision**, and **HDR** bitstreams.
 
 ## Features
 
-* BBTS / MPEG-TS 188-byte packet support
-* PAT / PMT parsing
-* HEVC / H.265 decryption
-* AES-128 key support
-* Dolby Vision RPU preservation
-* HDR Vivid metadata preservation
-* Dynamic HDR metadata handling
-* Native Rust implementation
+- **Sequential 188-byte MPEG-TS Streaming**: High-throughput buffered I/O with automatic adaptation field stuffing.
+- **Dynamic Video PID Detection**: Real-time PAT and PMT parsing to detect and decrypt dynamic video stream PIDs (PID 32, 33, 256, etc.).
+- **Automatic Base IV Extraction**: Extracts 16-byte Base IV from SDT (PID 17) and packet markers (`|v...|`).
+- **128-bit Lossless CTR Engine**: 128-bit big-endian counter increment (`ctr_inc`) with 0-based 10:1 Sample-AES block interval.
+- **Pure Bitstream Preservation**: 100% untouched preservation of SPS, PPS, VPS, SEI, Dolby Vision RPU, and HDR metadata without distortion or arbitrary injection.
+- **Strict Key Validation**: Enforces exact `KID:KEY` (32 hex : 32 hex) format.
+- **Pure Rust Implementation**: Zero external C dependencies with Link-Time Optimization (LTO) support.
 
 ## Build
 
@@ -19,45 +18,29 @@ A tool for decrypting protected **BBTS / MPEG-TS** streams with support for **HE
 cargo build --release
 ```
 
-Executable:
-
-```text
-target/release/bbts
-```
-
-On Windows:
-
-```text
-target\release\bbts.exe
-```
+Binary outputs:
+- **Linux / macOS**: `target/release/bbtsdecrypt`
+- **Windows**: `target\release\bbtsdecrypt.exe`
 
 ## Usage
 
-AES key:
-
 ```bash
-bbts -i input.bbts -o output.ts -k 306162d1837731abd3ad41c707943c27
+# Decrypt using KID:KEY pair (32 hex : 32 hex)
+bbtsdecrypt -i input.bbts -o output.ts -k 31379f0d5fcd5234862efd8aa9a4e95f:e81836fb4d37ddbc30ae4b80a3573146
 ```
 
-KID + key:
+### Options
 
-```bash
-bbts -i input.bbts -o output.ts -k 31379f0d5fcd5234862efd8aa9a4e95f:e81836fb4d37ddbc30ae4b80a3573146
-```
+- `-i, --input <PATH>`   : Input BBTS / TS file
+- `-o, --output <PATH>`  : Output decrypted TS file
+- `-k, --key <KID:KEY>`  : Key specification in `KID:KEY` format (32 hex : 32 hex)
+- `-h, --help`           : Print help information
 
 ## Requirements
 
-* Rust
-* Cargo
-* Rust Edition 2024
+- Rust (Edition 2024 or later)
+- Cargo
 
-## Issues and Support
+## License
 
-If you encounter any issues, please open an issue in the repository.
-Support and maintenance will be provided as time permits.
-
----
-
-## Acknowledgements
-
-Thank you for your interest in this project.
+This project is licensed under the GPL-3.0 License.

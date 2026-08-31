@@ -6,7 +6,6 @@ use std::collections::HashMap;
 pub(crate) struct PacketInfo {
     pub(crate) pid: u16,
     pub(crate) payload_unit_start: bool,
-    pub(crate) adaptation_field_control: u8,
     pub(crate) payload_offset: Option<usize>,
 }
 
@@ -25,7 +24,6 @@ pub(crate) fn packet_info(packet: &[u8]) -> Option<PacketInfo> {
             return Some(PacketInfo {
                 pid,
                 payload_unit_start,
-                adaptation_field_control,
                 payload_offset: None,
             });
         }
@@ -35,7 +33,6 @@ pub(crate) fn packet_info(packet: &[u8]) -> Option<PacketInfo> {
             return Some(PacketInfo {
                 pid,
                 payload_unit_start,
-                adaptation_field_control,
                 payload_offset: None,
             });
         }
@@ -45,7 +42,6 @@ pub(crate) fn packet_info(packet: &[u8]) -> Option<PacketInfo> {
         return Some(PacketInfo {
             pid,
             payload_unit_start,
-            adaptation_field_control,
             payload_offset: None,
         });
     }
@@ -53,7 +49,6 @@ pub(crate) fn packet_info(packet: &[u8]) -> Option<PacketInfo> {
     Some(PacketInfo {
         pid,
         payload_unit_start,
-        adaptation_field_control,
         payload_offset: Some(payload_offset),
     })
 }
@@ -217,117 +212,159 @@ pub(crate) fn extract_packet_block_key(packet: &[u8]) -> Option<[u8; 16]> {
     }
 }
 
-fn pad_or_truncate_packet(mut data: Vec<u8>) -> [u8; TS_PACKET_SIZE] {
-    if data.len() < TS_PACKET_SIZE {
-        data.resize(TS_PACKET_SIZE, 0xff);
-    } else if data.len() > TS_PACKET_SIZE {
-        data.truncate(TS_PACKET_SIZE);
-    }
-    let mut output = [0u8; TS_PACKET_SIZE];
-    output.copy_from_slice(&data);
-    output
+pub(crate) struct PSIAssembler {
+    buf: Vec<u8>,
+    expected_total: Option<usize>,
+    collecting: bool,
 }
 
-pub(crate) fn make_payload_packet_from_original(
-    packet: &[u8; TS_PACKET_SIZE],
-    payload: &[u8],
-) -> [u8; TS_PACKET_SIZE] {
-    let info = packet_info(packet);
-    let mut payload_offset = info
-        .as_ref()
-        .and_then(|value| value.payload_offset)
-        .unwrap_or(4);
-    let mut adaptation_field_control = info
-        .as_ref()
-        .map(|value| value.adaptation_field_control)
-        .unwrap_or(1);
-
-    if payload_offset > TS_PACKET_SIZE {
-        payload_offset = 4;
-        adaptation_field_control = 1;
-    }
-
-    let original_header = &packet[..payload_offset];
-    let payload_capacity = TS_PACKET_SIZE.saturating_sub(original_header.len());
-    let payload = &payload[..payload.len().min(payload_capacity)];
-    let stuffing_needed = payload_capacity.saturating_sub(payload.len());
-
-    if stuffing_needed == 0 {
-        let mut output_header = original_header.to_vec();
-        if output_header.len() >= 4 {
-            output_header[3] =
-                (output_header[3] & 0xcf) | ((adaptation_field_control & 0x03) << 4);
-        }
-        output_header.extend_from_slice(payload);
-        return pad_or_truncate_packet(output_header);
-    }
-
-    if adaptation_field_control == 3 && original_header.len() >= 5 {
-        let old_length = original_header[4] as usize;
-        let new_length = old_length + stuffing_needed;
-        if new_length <= 183 {
-            let mut output_header = original_header.to_vec();
-            output_header[3] = (output_header[3] & 0xcf) | 0x30;
-            output_header[4] = new_length as u8;
-            output_header.extend(std::iter::repeat(0xff).take(stuffing_needed));
-            output_header.extend_from_slice(payload);
-            return pad_or_truncate_packet(output_header);
+impl PSIAssembler {
+    pub(crate) fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            expected_total: None,
+            collecting: false,
         }
     }
 
-    let mut base_header = packet[..4].to_vec();
-    base_header[3] = (base_header[3] & 0xcf) | 0x30;
-    let adaptation_length = stuffing_needed - 1;
-    let mut output = base_header;
-    output.push(adaptation_length as u8);
-    if adaptation_length > 0 {
-        output.push(0x00);
-        if adaptation_length > 1 {
-            output.extend(std::iter::repeat(0xff).take(adaptation_length - 1));
+    pub(crate) fn push(&mut self, pkt: &[u8]) -> Option<Vec<u8>> {
+        if pkt.len() != TS_PACKET_SIZE {
+            return None;
         }
+        let info = packet_info(pkt)?;
+        let off = info.payload_offset?;
+        if off >= TS_PACKET_SIZE {
+            return None;
+        }
+
+        let mut payload = &pkt[off..];
+
+        if info.payload_unit_start {
+            if payload.is_empty() {
+                return None;
+            }
+            let pointer = payload[0] as usize;
+            if 1 + pointer > payload.len() {
+                return None;
+            }
+            payload = &payload[1 + pointer..];
+            self.buf.clear();
+            self.expected_total = None;
+            self.collecting = true;
+        }
+
+        if !self.collecting {
+            return None;
+        }
+
+        self.buf.extend_from_slice(payload);
+
+        if self.expected_total.is_none() && self.buf.len() >= 3 {
+            let section_length = (((self.buf[1] & 0x0f) as usize) << 8) | self.buf[2] as usize;
+            self.expected_total = Some(3 + section_length);
+        }
+
+        if let Some(expected) = self.expected_total {
+            if self.buf.len() >= expected {
+                let section = self.buf[..expected].to_vec();
+                self.buf.clear();
+                self.expected_total = None;
+                self.collecting = false;
+                return Some(section);
+            }
+        }
+
+        None
     }
-    output.extend_from_slice(payload);
-    pad_or_truncate_packet(output)
 }
 
-pub(crate) fn make_adaptation_only_packet_from_original(
-    packet: &[u8; TS_PACKET_SIZE],
-) -> [u8; TS_PACKET_SIZE] {
-    let mut output = Vec::with_capacity(TS_PACKET_SIZE);
-    let mut header = packet[..4].to_vec();
-    header[3] = (header[3] & 0xcf) | 0x20;
-    output.extend_from_slice(&header);
-    output.push(183);
-
-    let info = packet_info(packet);
-    let mut content = Vec::new();
-    if let Some(info) = info {
-        if info.adaptation_field_control == 3 && packet.len() >= 5 {
-            let old_length = packet[4] as usize;
-            let old_end = (5 + old_length).min(TS_PACKET_SIZE);
-            content.extend_from_slice(&packet[5..old_end]);
-        }
+pub(crate) fn parse_sdt_and_set_iv(section: &[u8], ivec: &mut [u8; 16]) -> bool {
+    if section.len() < 16 || section[0] != 0x42 {
+        return false;
     }
-    content.truncate(183);
-    output.extend_from_slice(&content);
-    output.extend(std::iter::repeat(0xff).take(183 - content.len()));
-    pad_or_truncate_packet(output)
+    let section_length = (((section[1] & 0x0f) as usize) << 8) | section[2] as usize;
+    let end = 3 + section_length;
+    if end > section.len() {
+        return false;
+    }
+
+    let mut pos = 3 + 8;
+    while pos + 5 <= end.saturating_sub(4) {
+        let desc_loop_len = (((section[pos + 3] & 0x0f) as usize) << 8) | section[pos + 4] as usize;
+        let mut dpos = pos + 5;
+        let dend = dpos + desc_loop_len;
+
+        while dpos + 2 <= dend && dpos + 2 <= end.saturating_sub(4) {
+            let tag = section[dpos];
+            let length = section[dpos + 1] as usize;
+            dpos += 2;
+            if dpos + length > section.len() {
+                break;
+            }
+            let body = &section[dpos..dpos + length];
+            dpos += length;
+
+            if tag == 0x48 && body.len() >= 3 {
+                let provider_len = body[1] as usize;
+                if 2 + provider_len >= body.len() {
+                    continue;
+                }
+                let sn_len_idx = 2 + provider_len;
+                let sn_len = body[sn_len_idx] as usize;
+                if sn_len_idx + 1 + sn_len > body.len() {
+                    continue;
+                }
+                let service_name = String::from_utf8_lossy(&body[sn_len_idx + 1..sn_len_idx + 1 + sn_len]);
+
+                if !service_name.contains("mdcm|") {
+                    continue;
+                }
+
+                let parts: Vec<&str> = service_name.split('|').collect();
+                if parts.len() < 4 {
+                    continue;
+                }
+
+                let mut iv_hex = parts[3].trim();
+                if iv_hex.is_empty() {
+                    continue;
+                }
+                if iv_hex.starts_with('v') || iv_hex.starts_with('V') {
+                    iv_hex = &iv_hex[1..];
+                }
+
+                if let Some(iv_bin) = decode_hex_16(iv_hex.as_bytes()) {
+                    *ivec = [0u8; 16];
+                    ivec[..12].copy_from_slice(&iv_bin[..12]);
+                    return true;
+                }
+            }
+        }
+        pos = dend;
+    }
+    false
 }
 
-pub(crate) fn update_pes_packet_length_if_needed(prefix: &[u8], payload_length: usize) -> Vec<u8> {
-    if prefix.len() < 6 || !prefix.starts_with(&[0x00, 0x00, 0x01]) {
-        return prefix.to_vec();
+pub(crate) fn parse_pmt_streams_map(section: &[u8]) -> HashMap<u16, u8> {
+    let mut streams = HashMap::new();
+    if section.len() < 12 || section[0] != 0x02 {
+        return streams;
     }
-    let current_length = ((prefix[4] as u16) << 8) | prefix[5] as u16;
-    if current_length == 0 {
-        return prefix.to_vec();
+    let section_length = (((section[1] & 0x0f) as usize) << 8) | section[2] as usize;
+    let end = 3 + section_length;
+    if end > section.len() {
+        return streams;
     }
-    let new_length = prefix.len().saturating_add(payload_length).saturating_sub(6);
-    if new_length > 0xffff {
-        return prefix.to_vec();
+
+    let program_info_length = (((section[10] & 0x0f) as usize) << 8) | section[11] as usize;
+    let mut pos = 12 + program_info_length;
+
+    while pos + 5 <= end.saturating_sub(4) {
+        let stream_type = section[pos];
+        let elementary_pid = (((section[pos + 1] & 0x1f) as u16) << 8) | section[pos + 2] as u16;
+        let es_info_length = (((section[pos + 3] & 0x0f) as usize) << 8) | section[pos + 4] as usize;
+        streams.insert(elementary_pid, stream_type);
+        pos += 5 + es_info_length;
     }
-    let mut output = prefix.to_vec();
-    output[4] = ((new_length >> 8) & 0xff) as u8;
-    output[5] = (new_length & 0xff) as u8;
-    output
+    streams
 }

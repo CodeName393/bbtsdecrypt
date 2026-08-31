@@ -1,185 +1,115 @@
-use crate::common::{AppResult, VideoMode, TS_PACKET_SIZE};
+use crate::common::{AppResult, TS_PACKET_SIZE};
 use crate::crypto::{parse_key_spec, AesBlockEncryptor};
-use crate::hevc::decrypt_es;
+use crate::hevc::decrypt_pes_normal;
 use crate::ts::{
-    extract_packet_block_key, make_adaptation_only_packet_from_original,
-    make_payload_packet_from_original, packet_info, parse_pat, parse_pmt_video_pids,
-    update_pes_packet_length_if_needed,
+    extract_packet_block_key, packet_info, parse_pat, parse_pmt_streams_map,
+    parse_pmt_video_pids, parse_sdt_and_set_iv, PSIAssembler,
 };
 use crate::ui::ProgressUi;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-#[derive(Clone)]
-struct GroupEntry {
-    offset: u64,
-    packet: [u8; TS_PACKET_SIZE],
+const SYNC: u8 = 0x47;
+const PID_PAT: u16 = 0x0000;
+const PID_SDT: u16 = 0x0011;
+
+struct PESHeaderChunk {
+    header_bytes: Vec<u8>,
+    header_size: usize,
 }
 
-struct PacketPart {
-    offset: u64,
-    packet: [u8; TS_PACKET_SIZE],
-    payload_unit_start: bool,
-    pes_header: Vec<u8>,
-}
-
-fn patch_group_in_output(
-    output: &mut File,
-    group_entries: &[GroupEntry],
-    block_key: Option<&[u8; 16]>,
+fn flush_pes_fn(
+    pes_buf: &mut Vec<u8>,
+    pes_headers: &mut Vec<PESHeaderChunk>,
+    iv_snap_for_pes: &mut Option<[u8; 16]>,
+    last_pid: &mut u16,
+    state_ready: bool,
+    stream_types: &HashMap<u16, u8>,
     encryptor: &AesBlockEncryptor,
-    decryption_key: &[u8; 16],
-    mode: VideoMode,
-) -> AppResult<bool> {
-    if group_entries.is_empty() || block_key.is_none() {
-        return Ok(false);
-    }
-    let block_key = block_key.unwrap();
-    let mut payload = Vec::new();
-    let mut packet_parts = Vec::new();
-
-    for entry in group_entries {
-        let Some(info) = packet_info(&entry.packet) else {
-            continue;
-        };
-        let Some(payload_offset) = info.payload_offset else {
-            continue;
-        };
-        let mut pes_header = Vec::new();
-        let mut payload_start = payload_offset;
-        if info.payload_unit_start {
-            let packet_payload = &entry.packet[payload_offset..];
-            if packet_payload.len() >= 9 && packet_payload.starts_with(&[0x00, 0x00, 0x01]) {
-                let pes_header_size = 9 + packet_payload[8] as usize;
-                if pes_header_size <= packet_payload.len() {
-                    pes_header.extend_from_slice(&packet_payload[..pes_header_size]);
-                    payload_start = payload_offset + pes_header_size;
-                }
-            }
-        }
-        packet_parts.push(PacketPart {
-            offset: entry.offset,
-            packet: entry.packet,
-            payload_unit_start: info.payload_unit_start,
-            pes_header,
-        });
-        payload.extend_from_slice(&entry.packet[payload_start..]);
-    }
-
-    if packet_parts.is_empty() {
-        return Ok(false);
-    }
-
-    let decrypted = decrypt_es(&payload, block_key, encryptor, decryption_key, mode);
-    let total_capacity: usize = packet_parts
-        .iter()
-        .map(|part| {
-            let payload_offset = packet_info(&part.packet)
-                .and_then(|info| info.payload_offset)
-                .filter(|&offset| offset <= TS_PACKET_SIZE)
-                .unwrap_or(4);
-            let prefix_len = if part.payload_unit_start {
-                part.pes_header.len()
-            } else {
-                0
-            };
-            TS_PACKET_SIZE
-                .saturating_sub(payload_offset)
-                .saturating_sub(prefix_len)
-        })
-        .sum();
-
-    if decrypted.len() > total_capacity {
-        return Err(format!(
-            "Metadata patch needs {} extra byte(s), but this PES has no packet capacity left",
-            decrypted.len() - total_capacity
-        )
-        .into());
-    }
-
-    let mut position = 0usize;
-    let mut ended = false;
-    let return_position = output.stream_position()?;
-
-    for part in packet_parts {
-        if ended {
-            let rebuilt = make_adaptation_only_packet_from_original(&part.packet);
-            output.seek(SeekFrom::Start(part.offset))?;
-            output.write_all(&rebuilt)?;
-            continue;
-        }
-
-        let mut prefix = if part.payload_unit_start {
-            part.pes_header
-        } else {
-            Vec::new()
-        };
-        if !prefix.is_empty() {
-            prefix = update_pes_packet_length_if_needed(&prefix, decrypted.len());
-        }
-
-        let payload_offset = packet_info(&part.packet)
-            .and_then(|info| info.payload_offset)
-            .filter(|&offset| offset <= TS_PACKET_SIZE)
-            .unwrap_or(4);
-        let capacity = TS_PACKET_SIZE
-            .saturating_sub(payload_offset)
-            .saturating_sub(prefix.len());
-        let remaining = decrypted.len().saturating_sub(position);
-
-        let rebuilt = if remaining == 0 {
-            ended = true;
-            if !prefix.is_empty() {
-                make_payload_packet_from_original(&part.packet, &prefix)
-            } else {
-                make_adaptation_only_packet_from_original(&part.packet)
-            }
-        } else {
-            let take = capacity.min(remaining);
-            let mut packet_payload = prefix;
-            packet_payload.extend_from_slice(&decrypted[position..position + take]);
-            position += take;
-            let rebuilt = make_payload_packet_from_original(&part.packet, &packet_payload);
-            if position >= decrypted.len() {
-                ended = true;
-            }
-            rebuilt
-        };
-
-        output.seek(SeekFrom::Start(part.offset))?;
-        output.write_all(&rebuilt)?;
-    }
-
-    output.seek(SeekFrom::Start(return_position))?;
-    Ok(true)
-}
-
-fn flush_group(
-    output: &mut File,
-    pid: u16,
-    current_groups: &mut HashMap<u16, Vec<GroupEntry>>,
-    current_group_keys: &mut HashMap<u16, Option<[u8; 16]>>,
-    active_block_key: Option<[u8; 16]>,
-    encryptor: &AesBlockEncryptor,
-    decryption_key: &[u8; 16],
-    mode: VideoMode,
+    writer: &mut BufWriter<File>,
 ) -> AppResult<()> {
-    let group = current_groups.remove(&pid).unwrap_or_default();
-    let group_key = current_group_keys.get(&pid).copied().flatten();
-    if !group.is_empty() {
-        patch_group_in_output(
-            output,
-            &group,
-            group_key.as_ref(),
-            encryptor,
-            decryption_key,
-            mode,
-        )?;
+    if pes_buf.is_empty() || pes_headers.is_empty() || !state_ready {
+        pes_buf.clear();
+        pes_headers.clear();
+        *iv_snap_for_pes = None;
+        *last_pid = 0xFFFF;
+        return Ok(());
     }
-    current_groups.insert(pid, Vec::new());
-    current_group_keys.insert(pid, active_block_key);
+
+    let sid_prev = if pes_buf.len() > 3 { pes_buf[3] } else { 0xE1 };
+    if (sid_prev & 0xF0 == 0xE0 || sid_prev == 0xE0) && pes_buf.len() > 8 && iv_snap_for_pes.is_some() {
+        let stream_type = stream_types.get(last_pid).copied().unwrap_or(0x24);
+        let decrypted = decrypt_pes_normal(
+            pes_buf,
+            stream_type,
+            encryptor,
+            &iv_snap_for_pes.unwrap(),
+        );
+        *pes_buf = decrypted;
+    }
+
+    let mut pes_remain = pes_buf.len();
+    let mut pes_pos = 0usize;
+
+    for (i, h) in pes_headers.iter().enumerate() {
+        let payload_cap = TS_PACKET_SIZE.saturating_sub(h.header_size);
+
+        if pes_remain == 0 {
+            writer.write_all(&h.header_bytes)?;
+            let padding = vec![0xff; payload_cap];
+            writer.write_all(&padding)?;
+        } else if pes_remain < payload_cap {
+            if i == pes_headers.len() - 1 {
+                let mut hdr = h.header_bytes.clone();
+                let stuffing_needed = payload_cap - pes_remain;
+                let afc = (hdr[3] >> 4) & 0x03;
+
+                if afc == 1 {
+                    hdr[3] = (hdr[3] & 0x0F) | 0x30;
+                    if stuffing_needed == 1 {
+                        hdr.push(0x00);
+                    } else {
+                        hdr.push((stuffing_needed - 1) as u8);
+                        hdr.push(0x00);
+                        if stuffing_needed > 2 {
+                            hdr.extend(std::iter::repeat(0xff).take(stuffing_needed - 2));
+                        }
+                    }
+                } else if afc == 3 {
+                    let af_len = hdr[4] as usize;
+                    let extra = stuffing_needed;
+                    hdr[4] = (af_len + extra) as u8;
+                    let mut new_hdr = Vec::with_capacity(hdr.len() + extra);
+                    new_hdr.extend_from_slice(&hdr[..5 + af_len]);
+                    new_hdr.extend(std::iter::repeat(0xff).take(extra));
+                    new_hdr.extend_from_slice(&hdr[5 + af_len..]);
+                    hdr = new_hdr;
+                }
+
+                writer.write_all(&hdr)?;
+                writer.write_all(&pes_buf[pes_pos..pes_pos + pes_remain])?;
+                pes_pos += pes_remain;
+                pes_remain = 0;
+            } else {
+                writer.write_all(&h.header_bytes)?;
+                writer.write_all(&pes_buf[pes_pos..pes_pos + pes_remain])?;
+                pes_pos += pes_remain;
+                pes_remain = 0;
+            }
+        } else {
+            writer.write_all(&h.header_bytes)?;
+            writer.write_all(&pes_buf[pes_pos..pes_pos + payload_cap])?;
+            pes_pos += payload_cap;
+            pes_remain -= payload_cap;
+        }
+    }
+
+    pes_buf.clear();
+    pes_headers.clear();
+    *iv_snap_for_pes = None;
+    *last_pid = 0xFFFF;
     Ok(())
 }
 
@@ -188,7 +118,6 @@ pub(crate) fn decrypt_bbts_streaming(
     output_path: &Path,
     key: &str,
     progress: &mut ProgressUi,
-    mode: VideoMode,
 ) -> AppResult<()> {
     let decryption_key = parse_key_spec(key)?;
     let encryptor = AesBlockEncryptor::new(&decryption_key);
@@ -197,122 +126,244 @@ pub(crate) fn decrypt_bbts_streaming(
         return Err("Input file is too small to be a TS/BBTS file".into());
     }
 
-    let mut source = File::open(input_path)?;
-    let mut output = OpenOptions::new()
-        .read(true)
+    let source = File::open(input_path)?;
+    let mut reader = BufReader::with_capacity(256 * 1024, source);
+    let output = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open(output_path)?;
+    let mut writer = BufWriter::with_capacity(256 * 1024, output);
 
+    let mut ivec = [0u8; 16];
+    let mut state_ready = false;
     let mut pmt_pids: HashSet<u16> = HashSet::new();
     let mut target_pids: HashSet<u16> = HashSet::new();
-    let mut fallback_video_pid: Option<u16> = None;
-    let mut active_block_key: Option<[u8; 16]> = None;
-    let mut current_groups: HashMap<u16, Vec<GroupEntry>> = HashMap::new();
-    let mut current_group_keys: HashMap<u16, Option<[u8; 16]>> = HashMap::new();
+    let mut stream_types: HashMap<u16, u8> = HashMap::new();
+
+    let mut sdt_asm = PSIAssembler::new();
+    let mut pmt_asm = PSIAssembler::new();
+
+    let mut pes_buf: Vec<u8> = Vec::new();
+    let mut pes_headers: Vec<PESHeaderChunk> = Vec::new();
+    let mut iv_snap_for_pes: Option<[u8; 16]> = None;
+    let mut last_pid: u16 = 0xFFFF;
     let mut done = 0u64;
 
+    let mut packet = [0u8; TS_PACKET_SIZE];
     loop {
-        let mut packet = [0u8; TS_PACKET_SIZE];
-        let mut read_total = 0usize;
-        while read_total < TS_PACKET_SIZE {
-            let count = source.read(&mut packet[read_total..])?;
-            if count == 0 {
+        match reader.read_exact(&mut packet) {
+            Ok(()) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                flush_pes_fn(
+                    &mut pes_buf,
+                    &mut pes_headers,
+                    &mut iv_snap_for_pes,
+                    &mut last_pid,
+                    state_ready,
+                    &stream_types,
+                    &encryptor,
+                    &mut writer,
+                )?;
                 break;
             }
-            read_total += count;
-        }
-        if read_total == 0 {
-            break;
-        }
-        if read_total != TS_PACKET_SIZE {
-            return Err("Input ends with an incomplete 188-byte TS packet".into());
+            Err(e) => return Err(e.into()),
         }
 
-        let output_offset = output.stream_position()?;
-        output.write_all(&packet)?;
         done += TS_PACKET_SIZE as u64;
+        progress.update(done)?;
 
-        let info = packet_info(&packet);
-        if let Some(info_ref) = info.as_ref() {
-            if info_ref.pid == 17 {
-                if let Some(found_key) = extract_packet_block_key(&packet) {
-                    active_block_key = Some(found_key);
+        if packet[0] != SYNC {
+            writer.write_all(&packet)?;
+            continue;
+        }
+
+        let Some(info) = packet_info(&packet) else {
+            writer.write_all(&packet)?;
+            continue;
+        };
+
+        let pid = info.pid;
+
+        // PAT (PID 0)
+        if pid == PID_PAT {
+            flush_pes_fn(
+                &mut pes_buf,
+                &mut pes_headers,
+                &mut iv_snap_for_pes,
+                &mut last_pid,
+                state_ready,
+                &stream_types,
+                &encryptor,
+                &mut writer,
+            )?;
+            let found = parse_pat(&packet);
+            pmt_pids.extend(found.values().copied());
+            writer.write_all(&packet)?;
+            continue;
+        }
+
+        // SDT (PID 17)
+        if pid == PID_SDT {
+            flush_pes_fn(
+                &mut pes_buf,
+                &mut pes_headers,
+                &mut iv_snap_for_pes,
+                &mut last_pid,
+                state_ready,
+                &stream_types,
+                &encryptor,
+                &mut writer,
+            )?;
+            if let Some(sec) = sdt_asm.push(&packet) {
+                let mut new_ivec = [0u8; 16];
+                if parse_sdt_and_set_iv(&sec, &mut new_ivec) {
+                    ivec = new_ivec;
+                    state_ready = true;
                 }
             }
+            if let Some(found_key) = extract_packet_block_key(&packet) {
+                ivec[..12].copy_from_slice(&found_key[..12]);
+                ivec[12..].fill(0);
+                state_ready = true;
+            }
+            writer.write_all(&packet)?;
+            continue;
+        }
 
-            if info_ref.pid == 0 {
-                let found_programs = parse_pat(&packet);
-                pmt_pids.extend(found_programs.values().copied());
-            } else if pmt_pids.contains(&info_ref.pid) {
-                let found_video_pids = parse_pmt_video_pids(&packet);
-                if !found_video_pids.is_empty() {
-                    target_pids = found_video_pids.into_iter().collect();
-                } else if let Some(pid) = fallback_video_pid {
-                    target_pids.clear();
-                    target_pids.insert(pid);
+        // PMT
+        if pmt_pids.contains(&pid) {
+            flush_pes_fn(
+                &mut pes_buf,
+                &mut pes_headers,
+                &mut iv_snap_for_pes,
+                &mut last_pid,
+                state_ready,
+                &stream_types,
+                &encryptor,
+                &mut writer,
+            )?;
+            let found_video_pids = parse_pmt_video_pids(&packet);
+            if !found_video_pids.is_empty() {
+                target_pids.extend(&found_video_pids);
+                for &vpid in &found_video_pids {
+                    stream_types.insert(vpid, 0x24);
                 }
             }
-
-            if target_pids.is_empty()
-                && info_ref.payload_unit_start
-                && active_block_key.is_some()
-                && info_ref.payload_offset.is_some()
-                && (32..=256).contains(&info_ref.pid)
-            {
-                fallback_video_pid = Some(info_ref.pid);
-                target_pids.clear();
-                target_pids.insert(info_ref.pid);
-            }
-
-            if target_pids.contains(&info_ref.pid) && info_ref.payload_offset.is_some() {
-                let pid = info_ref.pid;
-                if info_ref.payload_unit_start {
-                    if current_groups.get(&pid).is_some_and(|group| !group.is_empty()) {
-                        flush_group(
-                            &mut output,
-                            pid,
-                            &mut current_groups,
-                            &mut current_group_keys,
-                            active_block_key,
-                            &encryptor,
-                            &decryption_key,
-                            mode,
-                        )?;
+            if let Some(sec) = pmt_asm.push(&packet) {
+                let streams = parse_pmt_streams_map(&sec);
+                for (&spid, &stype) in &streams {
+                    stream_types.insert(spid, stype);
+                    if matches!(stype, 0x01 | 0x02 | 0x1b | 0x24 | 0x06) {
+                        target_pids.insert(spid);
                     }
-                    current_groups.insert(pid, Vec::new());
-                    current_group_keys.insert(pid, active_block_key);
                 }
-                if let Some(group) = current_groups.get_mut(&pid) {
-                    group.push(GroupEntry {
-                        offset: output_offset,
-                        packet,
-                    });
-                }
+            }
+            writer.write_all(&packet)?;
+            continue;
+        }
+
+        // Dynamic fallback for Video PID if PMT was not yet seen or incomplete
+        if target_pids.is_empty()
+            && info.payload_unit_start
+            && state_ready
+            && info.payload_offset.is_some()
+            && (32..=256).contains(&pid)
+            && pid != PID_SDT
+        {
+            target_pids.insert(pid);
+            stream_types.insert(pid, 0x24);
+        }
+
+        if !state_ready || !target_pids.contains(&pid) {
+            flush_pes_fn(
+                &mut pes_buf,
+                &mut pes_headers,
+                &mut iv_snap_for_pes,
+                &mut last_pid,
+                state_ready,
+                &stream_types,
+                &encryptor,
+                &mut writer,
+            )?;
+            writer.write_all(&packet)?;
+            continue;
+        }
+
+        let Some(off) = info.payload_offset else {
+            flush_pes_fn(
+                &mut pes_buf,
+                &mut pes_headers,
+                &mut iv_snap_for_pes,
+                &mut last_pid,
+                state_ready,
+                &stream_types,
+                &encryptor,
+                &mut writer,
+            )?;
+            writer.write_all(&packet)?;
+            continue;
+        };
+
+        if off >= TS_PACKET_SIZE {
+            flush_pes_fn(
+                &mut pes_buf,
+                &mut pes_headers,
+                &mut iv_snap_for_pes,
+                &mut last_pid,
+                state_ready,
+                &stream_types,
+                &encryptor,
+                &mut writer,
+            )?;
+            writer.write_all(&packet)?;
+            continue;
+        }
+
+        let mut is_new_pes = info.payload_unit_start;
+        if off + 4 <= TS_PACKET_SIZE
+            && packet[off] == 0x00
+            && packet[off + 1] == 0x00
+            && packet[off + 2] == 0x01
+        {
+            let sid = packet[off + 3];
+            if sid == 0xC0 || (sid & 0xF0) == 0xE0 {
+                is_new_pes = true;
             }
         }
 
-        progress.update(done)?;
-    }
-
-    let pids: Vec<u16> = current_groups.keys().copied().collect();
-    for pid in pids {
-        if current_groups.get(&pid).is_some_and(|group| !group.is_empty()) {
-            flush_group(
-                &mut output,
-                pid,
-                &mut current_groups,
-                &mut current_group_keys,
-                active_block_key,
+        if is_new_pes && !pes_buf.is_empty() {
+            flush_pes_fn(
+                &mut pes_buf,
+                &mut pes_headers,
+                &mut iv_snap_for_pes,
+                &mut last_pid,
+                state_ready,
+                &stream_types,
                 &encryptor,
-                &decryption_key,
-                mode,
+                &mut writer,
             )?;
         }
-    }
-    output.flush()?;
-    progress.finish()?;
 
+        if !is_new_pes && pes_buf.is_empty() {
+            writer.write_all(&packet)?;
+            continue;
+        }
+
+        if is_new_pes {
+            iv_snap_for_pes = Some(ivec);
+        }
+
+        last_pid = pid;
+
+        pes_buf.extend_from_slice(&packet[off..]);
+        pes_headers.push(PESHeaderChunk {
+            header_bytes: packet[..off].to_vec(),
+            header_size: off,
+        });
+    }
+
+    writer.flush()?;
+    progress.finish()?;
     Ok(())
 }
