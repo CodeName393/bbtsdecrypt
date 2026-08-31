@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bbts"
+name = "bbtsdecrypt"
 version = "0.6.6"
 dependencies = [
  "aes",

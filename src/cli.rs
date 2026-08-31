@@ -16,7 +16,7 @@ fn print_usage(program: &str) {
 
 pub(crate) fn parse_cli() -> AppResult<Cli> {
     let mut args = env::args();
-    let program = args.next().unwrap_or_else(|| "bbts".to_string());
+    let program = args.next().unwrap_or_else(|| "bbtsdecrypt".to_string());
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut key: Option<String> = None;
